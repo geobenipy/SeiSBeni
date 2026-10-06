@@ -6,7 +6,7 @@ from multiprocessing import Pool, cpu_count
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QFileDialog, QLabel, 
                              QProgressBar, QTableWidget, QTableWidgetItem, 
-                             QSplitter, QScrollArea, QSpinBox, QDoubleSpinBox, QCheckBox)
+                             QSplitter, QScrollArea, QSpinBox, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
 from PyQt5.QtWebEngineWidgets import QWebEngineView
 import matplotlib
@@ -47,60 +47,42 @@ TRACE_HEADERS = {
 }
 
 # -------------------------------------------------------
-# IBM Float (SEG-Y Format 1) -> IEEE Float
-# -------------------------------------------------------
-def ibm2ieee(ibm_uint32):
-    """Wandelt IBM-370 Single-Precision (uint32 Array) in IEEE float32 um."""
-    sign = ((ibm_uint32 >> 31) & 0x01).astype(np.float64)
-    exponent = ((ibm_uint32 >> 24) & 0x7f).astype(np.float64)
-    mantissa = (ibm_uint32 & 0x00ffffff).astype(np.float64)
-    value = (1.0 - 2.0 * sign) * (mantissa / 16777216.0) * np.power(16.0, exponent - 64.0)
-    return value.astype(np.float32)
-
-# Bytes pro Sample je SEG-Y Format-Code (Format 8 = int8, 1 Byte)
-BYTES_PER_SAMPLE = {1: 4, 2: 4, 3: 2, 5: 4, 8: 1}
-
-def decode_trace(raw, format_code):
-    """Dekodiert die Rohbytes eines Traces anhand des SEG-Y Format-Codes."""
-    if format_code == 1:
-        return ibm2ieee(np.frombuffer(raw, dtype='>u4'))
-    if format_code == 2:
-        return np.frombuffer(raw, dtype='>i4').astype(np.float32)
-    if format_code == 3:
-        return np.frombuffer(raw, dtype='>i2').astype(np.float32)
-    if format_code == 8:
-        return np.frombuffer(raw, dtype='i1').astype(np.float32)
-    # Format 5 (IEEE) und unbekannte Formate
-    return np.frombuffer(raw, dtype='>f4')
-
-# -------------------------------------------------------
 # Helper function für Multiprocessing
 # -------------------------------------------------------
 def load_trace_chunk(args):
-    """Lädt die angegebenen Trace-Indizes (für Multiprocessing).
-    Fehler werden nicht verschluckt, sondern an den Loader-Thread weitergegeben."""
-    filepath, indices, trace_size, n_samples, format_code, downsample_factor = args
-    bytes_per_sample = BYTES_PER_SAMPLE.get(format_code, 4)
-    n_samples_ds = n_samples // downsample_factor
-    chunk_data = []
-    chunk_headers = []
-
-    with open(filepath, 'rb') as f:
-        for i in indices:
-            f.seek(3600 + i * trace_size)
-            header = f.read(240)
-            if len(header) < 240:
-                break
-            chunk_headers.append(header)
-
-            trace_data = decode_trace(f.read(n_samples * bytes_per_sample), format_code)
-            if downsample_factor > 1:
-                trace_data = trace_data[::downsample_factor]
-            chunk_data.append(trace_data[:n_samples_ds])
-
-    if not chunk_data:
-        return [], np.empty((0, n_samples_ds), dtype=np.float32)
-    return chunk_headers, np.array(chunk_data, dtype=np.float32)
+    """Lädt einen Chunk von Traces (für Multiprocessing)."""
+    filepath, start_idx, end_idx, trace_size, n_samples, bytes_per_sample, format_code, downsample_factor = args
+    
+    try:
+        with open(filepath, 'rb') as f:
+            n_samples_ds = n_samples // downsample_factor
+            chunk_data = []
+            chunk_headers = []
+            
+            for i in range(start_idx, end_idx):
+                f.seek(3600 + i * trace_size)
+                header = f.read(240)
+                if len(header) < 240:
+                    break
+                chunk_headers.append(header)
+                
+                # Trace Daten lesen
+                if format_code == 1 or format_code == 5:
+                    trace_data = np.frombuffer(f.read(n_samples * 4), dtype='>f4')
+                elif format_code == 3:
+                    trace_data = np.frombuffer(f.read(n_samples * 2), dtype='>i2').astype(np.float32)
+                else:
+                    trace_data = np.frombuffer(f.read(n_samples * 4), dtype='>f4')
+                
+                # Downsampling
+                if downsample_factor > 1:
+                    trace_data = trace_data[::downsample_factor]
+                
+                chunk_data.append(trace_data[:n_samples_ds])
+            
+            return chunk_headers, np.array(chunk_data, dtype=np.float32)
+    except:
+        return [], np.array([])
 
 # -------------------------------------------------------
 # Worker Thread für SEGY Laden
@@ -132,7 +114,7 @@ class SEGYLoaderThread(QThread):
                 dt_us = struct.unpack('>H', binary_header[16:18])[0]
                 format_code = struct.unpack('>H', binary_header[24:26])[0]
                 
-                bytes_per_sample = BYTES_PER_SAMPLE.get(format_code, 4)
+                bytes_per_sample = {1: 4, 2: 4, 3: 2, 5: 4, 8: 1}.get(format_code, 4)
                 
                 self.progress.emit(40, "Zähle Traces...")
                 
@@ -158,9 +140,11 @@ class SEGYLoaderThread(QThread):
                     if chunk_indices:
                         chunks.append((
                             self.filepath,
-                            chunk_indices,
+                            chunk_indices[0],
+                            chunk_indices[-1] + 1,
                             trace_size,
                             n_samples,
+                            bytes_per_sample,
                             format_code,
                             self.downsample_factor
                         ))
@@ -198,8 +182,7 @@ class SEGYLoaderThread(QThread):
                     'trace_headers': trace_headers,
                     'data': data,
                     'trace_skip': self.trace_skip,
-                    'downsample_factor': self.downsample_factor,
-                    'coord_scalar': struct.unpack('>h', trace_headers[0][70:72])[0] if trace_headers else 0
+                    'downsample_factor': self.downsample_factor
                 }
                 
                 self.finished.emit(result)
@@ -207,25 +190,15 @@ class SEGYLoaderThread(QThread):
         except Exception as e:
             self.error.emit(str(e))
 
-def coord_factor_from_scalar(scalar):
-    """SEG-Y Koordinaten-Skalar -> Faktor (Header-Wert * Faktor = Meter).
-    Positiver Skalar wird multipliziert, negativer dividiert. 0 = nicht gesetzt (None)."""
-    if scalar > 0:
-        return float(scalar)
-    if scalar < 0:
-        return 1.0 / abs(scalar)
-    return None
-
 # -------------------------------------------------------
 # Viewer Fenster
 # -------------------------------------------------------
 class SEGYViewerWindow(QMainWindow):
-    def __init__(self, segy_data, utm_zone=34, utm_hemisphere='N', coord_scale=0.1):
+    def __init__(self, segy_data, utm_zone=33, utm_hemisphere='N'):
         super().__init__()
         self.segy_data = segy_data
         self.utm_zone = utm_zone
         self.utm_hemisphere = utm_hemisphere
-        self.coord_scale = coord_scale  # Koordinaten-Faktor (Header-Wert * Faktor = Meter)
         self.amp_gain = 1.0  # Amplituden-Verstärkung
         self.initUI()
         
@@ -296,23 +269,14 @@ class SEGYViewerWindow(QMainWindow):
         self.canvas = FigureCanvasQTAgg(self.figure)
         self.toolbar = NavigationToolbar2QT(self.canvas, self)
         
-        plot_widget = QWidget()
-        plot_layout = QVBoxLayout(plot_widget)
-        plot_layout.setContentsMargins(0, 0, 0, 0)
-        plot_layout.addWidget(self.toolbar)
-        plot_layout.addWidget(self.canvas)
-
+        seismic_layout.addWidget(self.toolbar)
+        seismic_layout.addWidget(self.canvas)
+        
         # Karte (optional)
         self.map_view = QWebEngineView()
         self.create_map()
-
-        # Plot und Karte untereinander, Trennlinie verschiebbar
-        plot_splitter = QSplitter(Qt.Vertical)
-        plot_splitter.addWidget(plot_widget)
-        plot_splitter.addWidget(self.map_view)
-        plot_splitter.setSizes([700, 300])
-        seismic_layout.addWidget(plot_splitter)
-
+        seismic_layout.addWidget(self.map_view)
+        
         splitter.addWidget(seismic_widget)
         splitter.setSizes([400, 1200])
         
@@ -413,8 +377,8 @@ class SEGYViewerWindow(QMainWindow):
             headers = self.segy_data['trace_headers']
             
             for i, header in enumerate(headers[::50]):  # Jeden 50. Trace
-                scale = self.coord_scale
-
+                scale = 0.1   # change for every survey!
+                
                 x = struct.unpack('>i', header[72:76])[0] * scale
                 y = struct.unpack('>i', header[76:80])[0] * scale
                 
@@ -425,9 +389,6 @@ class SEGYViewerWindow(QMainWindow):
                     lon, lat = transformer.transform(x, y)
                     coords.append((lat, lon))
             
-            if not coords:
-                coords = self.load_sidecar_navigation()
-
             if coords:
                 center_lat = np.mean([c[0] for c in coords])
                 center_lon = np.mean([c[1] for c in coords])
@@ -446,32 +407,6 @@ class SEGYViewerWindow(QMainWindow):
                 
         except Exception as e:
             self.map_view.setHtml(f"<h3>Karte nicht verfügbar: {e}</h3>")
-
-    def load_sidecar_navigation(self):
-        """Liest <Dateiname>_nav.csv (Spalten ffid,lon,lat) neben der SEG-Y Datei.
-        Wird nur genutzt, wenn die Trace-Header keine Koordinaten enthalten."""
-        import csv
-        base, _ = os.path.splitext(self.segy_data['filepath'])
-        nav_path = base + '_nav.csv'
-        if not os.path.isfile(nav_path):
-            return []
-        try:
-            with open(nav_path, 'r', newline='') as f:
-                rows = [(float(r['ffid']), float(r['lat']), float(r['lon'])) for r in csv.DictReader(f)]
-            if not rows:
-                return []
-            rows.sort()
-            nav_ffid = np.array([r[0] for r in rows])
-            nav_lat = np.array([r[1] for r in rows])
-            nav_lon = np.array([r[2] for r in rows])
-
-            # Gleiche Abtastung wie bei den Header-Koordinaten (jeder 50. Trace)
-            trace_ffid = np.array([struct.unpack('>i', h[8:12])[0] for h in self.segy_data['trace_headers'][::50]], dtype=float)
-            lat = np.interp(trace_ffid, nav_ffid, nav_lat)
-            lon = np.interp(trace_ffid, nav_ffid, nav_lon)
-            return list(zip(lat, lon))
-        except Exception:
-            return []
 
 # -------------------------------------------------------
 # Main GUI
@@ -500,25 +435,12 @@ class SEGYViewerApp(QMainWindow):
         utm_layout.addWidget(QLabel('UTM Zone:'))
         self.utm_zone_spin = QSpinBox()
         self.utm_zone_spin.setRange(1, 60)
-        self.utm_zone_spin.setValue(34)
+        self.utm_zone_spin.setValue(33)
         utm_layout.addWidget(self.utm_zone_spin)
-
+        
         self.utm_north_check = QCheckBox('Northern Hemisphere')
         self.utm_north_check.setChecked(True)
         utm_layout.addWidget(self.utm_north_check)
-
-        utm_layout.addWidget(QLabel('Koordinaten-Faktor:'))
-        self.coord_scale_spin = QDoubleSpinBox()
-        self.coord_scale_spin.setRange(0.000001, 1000000)
-        self.coord_scale_spin.setDecimals(6)
-        self.coord_scale_spin.setValue(0.1)
-        self.coord_scale_spin.setToolTip('Header-Koordinate * Faktor = Meter (Standard 0.1 wie bisher)')
-        utm_layout.addWidget(self.coord_scale_spin)
-
-        self.use_header_scalar_check = QCheckBox('Header-Skalar nutzen')
-        self.use_header_scalar_check.setChecked(True)
-        self.use_header_scalar_check.setToolTip('Skalar aus Trace-Header (Bytes 71-72) hat Vorrang vor dem Faktor')
-        utm_layout.addWidget(self.use_header_scalar_check)
         utm_layout.addStretch()
         layout.addLayout(utm_layout)
         
@@ -613,16 +535,11 @@ class SEGYViewerApp(QMainWindow):
         utm_zone = self.utm_zone_spin.value()
         utm_hemisphere = 'N' if self.utm_north_check.isChecked() else 'S'
         
-        coord_scale = self.coord_scale_spin.value()
-        if self.use_header_scalar_check.isChecked():
-            header_factor = coord_factor_from_scalar(segy_data.get('coord_scalar', 0))
-            if header_factor is not None:
-                coord_scale = header_factor
-        viewer = SEGYViewerWindow(segy_data, utm_zone, utm_hemisphere, coord_scale)
+        viewer = SEGYViewerWindow(segy_data, utm_zone, utm_hemisphere)
         viewer.show()
         self.viewer_windows.append(viewer)
-
-        self.status_label.setText(f'Viewer geöffnet für {os.path.basename(segy_data["filepath"])} (Koordinaten-Faktor {coord_scale:g})')
+        
+        self.status_label.setText(f'Viewer geöffnet für {os.path.basename(segy_data["filepath"])}')
     
     def on_load_error(self, error_msg):
         self.progress_bar.setVisible(False)
